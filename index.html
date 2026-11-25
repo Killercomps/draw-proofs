@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KillerComps draw verifier (independent)</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  body { max-width: 760px; margin: 32px auto; padding: 0 16px; line-height: 1.5; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.lede { margin: 0 0 20px; opacity: .8; }
+  label { display: block; font-weight: 600; margin: 14px 0 4px; font-size: 14px; }
+  input[type=url], input[type=text] { width: 100%; padding: 9px 10px; font: inherit; box-sizing: border-box; }
+  .or { font-size: 13px; opacity: .7; margin: 4px 0; }
+  button { margin-top: 18px; padding: 10px 18px; font: inherit; font-weight: 700; cursor: pointer; }
+  ol#out { padding-left: 0; list-style: none; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+  ol#out li { padding: 6px 8px; border-bottom: 1px solid #8884; word-break: break-all; }
+  .pass::before { content: "PASS  "; color: #16a34a; font-weight: 700; }
+  .fail::before { content: "FAIL  "; color: #dc2626; font-weight: 700; }
+  .skip::before { content: "SKIP  "; color: #a16207; font-weight: 700; }
+  .note { font-size: 13px; opacity: .8; }
+  details { margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1>KillerComps draw verifier</h1>
+<p class="lede">Runs entirely in your browser with Web Crypto and the public drand network. Nothing is sent anywhere. The code is this one file, so read it before you trust it.</p>
+
+<label for="page">Proof page link</label>
+<input id="page" type="url" placeholder="https://killercomps.com/verify/draw/your-competition">
+<p class="or">or give the three files yourself (URLs, or pick saved files). Take the lock and result from the public GitHub repo, and the entry list from the site.</p>
+
+<details>
+  <summary>Use individual files</summary>
+  <label for="lock">Lock file (lock-….json)</label>
+  <input id="lock" type="text" placeholder="URL"> <input id="lockFile" type="file" accept=".json">
+  <label for="entries">Locked entry list (entries-….json)</label>
+  <input id="entries" type="text" placeholder="URL"> <input id="entriesFile" type="file" accept=".json">
+  <label for="result">Result file (result-….json)</label>
+  <input id="result" type="text" placeholder="URL"> <input id="resultFile" type="file" accept=".json">
+</details>
+
+<button id="go" type="button">Verify</button>
+<ol id="out"></ol>
+<p class="note" id="ots"></p>
+
+<script>
+(function () {
+  "use strict";
+  var RELAYS = ["https://api.drand.sh", "https://drand.cloudflare.com"];
+  var out = document.getElementById("out");
+  var failures = 0;
+
+  function hex(buf) { return Array.prototype.map.call(new Uint8Array(buf), function (b) { return b.toString(16).padStart(2, "0"); }).join(""); }
+  function sha256(text) { return crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)).then(hex); }
+  function hmac(key, msg) {
+    var enc = new TextEncoder();
+    return crypto.subtle.importKey("raw", enc.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"])
+      .then(function (k) { return crypto.subtle.sign("HMAC", k, enc.encode(msg)); }).then(hex);
+  }
+  function line(cls, text) { var li = document.createElement("li"); li.className = cls; li.textContent = text; out.appendChild(li); }
+  function check(label, ok, detail) { if (!ok) failures++; line(ok ? "pass" : "fail", label + (detail ? "  (" + detail + ")" : "")); }
+
+  // Text of a picked file, else of a URL. Text, not JSON: hashes are over exact bytes.
+  function load(fileInput, url) {
+    var f = fileInput && fileInput.files && fileInput.files[0];
+    if (f) return f.text();
+    if (!url) return Promise.reject(new Error("missing input"));
+    return fetch(url, { mode: "cors" }).then(function (r) { if (!r.ok) throw new Error(url + " -> HTTP " + r.status); return r.text(); });
+  }
+
+  async function run() {
+    out.innerHTML = ""; failures = 0; document.getElementById("ots").textContent = "";
+    var page = document.getElementById("page").value.trim().replace(/\/+$/, "");
+    var lockUrl = document.getElementById("lock").value.trim();
+    var entriesUrl = document.getElementById("entries").value.trim();
+    var resultUrl = document.getElementById("result").value.trim();
+
+    if (page) {
+      var report = JSON.parse(await load(null, page + "/report.json"));
+      if (!report.lock) { line("fail", "This draw did not go through a lock, so there is no lock to verify."); return; }
+      lockUrl = lockUrl || report.lock.lock_url;
+      entriesUrl = entriesUrl || report.lock.entries_url;
+      resultUrl = resultUrl || report.lock.result_url;
+    }
+
+    var lockText = await load(document.getElementById("lockFile"), lockUrl);
+    var entriesText = await load(document.getElementById("entriesFile"), entriesUrl);
+    var result = JSON.parse(await load(document.getElementById("resultFile"), resultUrl));
+    var lock = JSON.parse(lockText);
+    line("", lock.title + " — locked " + lock.locked_at + ", " + lock.entry_count + " entries, drand round " + lock.drand_round);
+
+    var lockHash = await sha256(lockText);
+    check("Lock file hash matches the result", lockHash === result.commitment_hash, lockHash);
+    var m = String(lockUrl).match(/[0-9a-f]{64}/);
+    if (m) check("Lock file hash matches its URL", lockHash === m[0]);
+
+    var entriesHash = await sha256(entriesText);
+    var entries = JSON.parse(entriesText);
+    check("Entry list hash matches the lock", entriesHash === lock.entries_hash, entriesHash);
+    check("Entry count matches the lock", entries.length === lock.entry_count, String(entries.length));
+
+    check("Server seed matches the hash committed before the draw", (await sha256(result.server_seed)) === lock.server_seed_hash);
+
+    var randomness = null;
+    for (var i = 0; i < RELAYS.length; i++) {
+      try {
+        var b = await (await fetch(RELAYS[i] + "/" + lock.drand_chain_hash + "/public/" + lock.drand_round)).json();
+        check("drand round " + lock.drand_round + " from " + new URL(RELAYS[i]).host, b.randomness === result.drand_randomness);
+        randomness = randomness || b.randomness;
+      } catch (e) { line("skip", RELAYS[i] + " unreachable"); }
+    }
+    if (!randomness) check("drand reachable", false, "no relay answered");
+
+    try {
+      var info = await (await fetch(RELAYS[0] + "/" + lock.drand_chain_hash + "/info")).json();
+      var roundAt = (info.genesis_time + (lock.drand_round - 1) * info.period) * 1000;
+      var lockedAt = Date.parse(lock.locked_at);
+      check("Lock was made before its round was published", lockedAt < roundAt,
+        "locked " + new Date(lockedAt).toISOString() + ", round " + new Date(roundAt).toISOString());
+    } catch (e) { line("skip", "round time unavailable"); }
+
+    var h = await hmac(result.server_seed, randomness || result.drand_randomness);
+    check("HMAC-SHA256(seed, randomness) matches", h === result.final_hmac);
+    var index = Number(BigInt("0x" + h.slice(0, 15)) % BigInt(entries.length));
+    check("Winning index reproduced", index === result.winner_index, String(index));
+    var row = entries[index] || [];
+    check("Winning ticket is that entry on the locked list", row[0] === result.winning_ticket, "#" + row[0] + " " + (row[1] || ""));
+
+    line(failures ? "fail" : "pass", failures ? failures + " check(s) failed." : "All checks passed. The winner is reproduced from the lock and public randomness.");
+    if (/^https?:/.test(lockUrl)) {
+      var p = document.getElementById("ots");
+      var a = document.createElement("a");
+      a.href = lockUrl + ".ots"; a.textContent = "the .ots file";
+      p.append("Bitcoin timestamp of the lock: download ", a, " and drop it, with the lock file, on opentimestamps.org.");
+    }
+  }
+
+  document.getElementById("go").addEventListener("click", function () {
+    run().catch(function (e) { line("fail", "Error: " + e.message); });
+  });
+  var q = new URLSearchParams(location.search).get("page");
+  if (q) { document.getElementById("page").value = q; }
+})();
+</script>
+</body>
+</html>
